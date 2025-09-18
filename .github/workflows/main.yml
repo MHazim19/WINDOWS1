@@ -140,10 +140,8 @@ jobs:
           }
           $links = $links_string.Split('!')
           
-          # Lokasi baru: Menentukan path ke folder Downloads milik user RDP
           $downloadPath = "C:\Users\RDP\Downloads"
           
-          # Membuat folder Downloads jika belum ada
           if (-not (Test-Path $downloadPath)) {
               New-Item -ItemType Directory -Force -Path $downloadPath
           }
@@ -152,15 +150,22 @@ jobs:
           foreach ($link in $links) {
             if (-not [string]::IsNullOrWhiteSpace($link)) {
               try {
-                $fileName = [System.IO.Path]::GetFileName($link)
-                # Menggunakan path download yang baru
-                $outputPath = [System.IO.Path]::Combine($downloadPath, $fileName)
+                # Mengambil nama file mentah dari URL
+                $fileNameFromUrl = [System.IO.Path]::GetFileName($link)
+                
+                # ===================================================================
+                # BARU: Membersihkan nama file dari karakter ilegal (seperti ?, =, &)
+                # ===================================================================
+                $sanitizedFileName = $fileNameFromUrl -replace '[\\/:*?"<>|]', '_'
+                
+                # Menggunakan nama file yang sudah bersih
+                $outputPath = [System.IO.Path]::Combine($downloadPath, $sanitizedFileName)
+
                 Write-Host "Downloading $link to $outputPath..."
                 Invoke-WebRequest -Uri $link.Trim() -OutFile $outputPath
-                Write-Host "Successfully downloaded $fileName."
+                Write-Host "Successfully downloaded '$sanitizedFileName'."
                 $downloadedFiles++
               } catch {
-                # Jika download gagal, hanya akan menampilkan error dan lanjut ke link berikutnya
                 Write-Error "Failed to download $link. Error: $_"
               }
             }
@@ -173,7 +178,6 @@ jobs:
             $body = @{ chat_id = $chat_id; text = $message; parse_mode = 'Markdown' } | ConvertTo-Json
             Invoke-RestMethod -Uri $telegram_url -Method Post -Body $body -ContentType 'application/json'
           }
-
       - name: Maintain Connection & Send 5-Minute Warning
         run: |
           $repo_name = "${{ github.event.repository.name }}"
