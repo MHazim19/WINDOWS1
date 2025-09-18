@@ -1,6 +1,7 @@
-name: RDP with Dynu DNS
+name: RDP with Telegram Input
 on:
   workflow_dispatch:
+
 jobs:
   secure-rdp:
     runs-on: windows-2022
@@ -12,6 +13,7 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
           netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389
           Restart-Service -Name TermService -Force
+
       - name: Create RDP User with Secure Password
         run: |
           $password = "Qwe123!"
@@ -20,10 +22,12 @@ jobs:
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
       - name: Install Tailscale
         run: |
           Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile "tailscale_setup.exe"
           Start-Process -FilePath ".\tailscale_setup.exe" -ArgumentList "/S" -Wait
+
       - name: Establish Tailscale Connection
         run: |
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
@@ -35,6 +39,7 @@ jobs:
           }
           if (-not $tsIP) { Write-Error "Tailscale IP not assigned."; exit 1 }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
       - name: Update Dynu DNS Record
         run: |
           $user = '${{ secrets.DYNU_USER }}'
@@ -47,13 +52,13 @@ jobs:
           Write-Host "Updating Dynu record for $hostname..."
           $response = Invoke-RestMethod -Uri $updateUrl -UserAgent $userAgent
           if ($response -like "good*" -or $response -like "nochg*") {
-              Write-Host "Successfully updated Dynu DNS. Response: $response"
-              echo "DDNS_HOSTNAME=$hostname" >> $env:GITHUB_ENV
+            Write-Host "Successfully updated Dynu DNS. Response: $response"
+            echo "DDNS_HOSTNAME=$hostname" >> $env:GITHUB_ENV
           } else {
-              Write-Error "Failed to update Dynu DNS. Response: $response"; exit 1
+            Write-Error "Failed to update Dynu DNS. Response: $response"; exit 1
           }
+          
       - name: Send Connection Details to Telegram
-        if: success()
         run: |
           $bot_token = '${{ secrets.TELEGRAM_TOKEN }}'
           $chat_id = '${{ secrets.TELEGRAM_CHAT_ID }}'
@@ -72,6 +77,103 @@ jobs:
           $telegram_url = "https://api.telegram.org/bot$bot_token/sendMessage"
           $body = @{ chat_id = $chat_id; text = $message; parse_mode = 'Markdown' } | ConvertTo-Json
           Invoke-RestMethod -Uri $telegram_url -Method Post -Body $body -ContentType 'application/json'
+
+      - name: Wait for Download Links from Telegram
+        id: telegram_input
+        run: |
+          $bot_token = '${{ secrets.TELEGRAM_TOKEN }}'
+          $chat_id = '${{ secrets.TELEGRAM_CHAT_ID }}'
+          $timeoutSeconds = 300 # Timeout 5 menit
+          $pollingInterval = 10 # Cek setiap 10 detik
+          $links_found = ""
+
+          # Kirim pesan permintaan input
+          $request_message = "▶️ *Menunggu Input Link Download*\n\nKirim daftar link Anda dalam satu pesan dengan pemisah tanda seru (!).\nContoh: `link1.com/file.zip!link2.com/file.rar`\n\n_Workflow akan menunggu selama 5 menit sebelum batal otomatis._"
+          $request_url = "https://api.telegram.org/bot$bot_token/sendMessage"
+          $request_body = @{ chat_id = $chat_id; text = $request_message; parse_mode = 'Markdown' } | ConvertTo-Json
+          Invoke-RestMethod -Uri $request_url -Method Post -Body $request_body -ContentType 'application/json'
+
+          # Mulai polling untuk mendapatkan update
+          $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+          $offset = 0
+          while ($stopwatch.Elapsed.TotalSeconds -lt $timeoutSeconds) {
+            $update_url = "https://api.telegram.org/bot$bot_token/getUpdates?offset=$offset&limit=10&timeout=20"
+            try {
+              $updates = Invoke-RestMethod -Uri $update_url -Method Get
+              if ($updates.ok -and $updates.result.Count -gt 0) {
+                foreach ($update in $updates.result) {
+                  $offset = $update.update_id + 1
+                  if ($update.message.chat.id -eq $chat_id -and $update.message.text) {
+                    Write-Host "Pesan diterima dari user: $($update.message.text)"
+                    $links_found = $update.message.text
+                    break
+                  }
+                }
+              }
+            } catch {
+              Write-Warning "Gagal mengambil update dari Telegram. Error: $_"
+            }
+
+            if ($links_found) { break }
+            Start-Sleep -Seconds $pollingInterval
+          }
+          $stopwatch.Stop()
+
+          if ($links_found) {
+            Write-Host "Link ditemukan: $links_found"
+            echo "links=$links_found" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Error "Timeout: Tidak ada link yang diterima dari Telegram dalam 5 menit."
+            # Kirim pesan timeout
+            $timeout_message = "❌ *Proses Dibatalkan*\n\nTidak ada input link yang diterima dalam 5 menit."
+            $timeout_body = @{ chat_id = $chat_id; text = $timeout_message; parse_mode = 'Markdown' } | ConvertTo-Json
+            Invoke-RestMethod -Uri $request_url -Method Post -Body $timeout_body -ContentType 'application/json'
+            exit 1
+          }
+
+      - name: Download Files from Telegram Input
+        run: |
+          $links_string = "${{ steps.telegram_input.outputs.links }}"
+          if ([string]::IsNullOrWhiteSpace($links_string)) {
+            Write-Host "Tidak ada link yang diberikan untuk diunduh."
+            exit 0
+          }
+          $links = $links_string.Split('!')
+          
+          # Lokasi baru: Menentukan path ke folder Downloads milik user RDP
+          $downloadPath = "C:\Users\RDP\Downloads"
+          
+          # Membuat folder Downloads jika belum ada
+          if (-not (Test-Path $downloadPath)) {
+              New-Item -ItemType Directory -Force -Path $downloadPath
+          }
+
+          $downloadedFiles = 0
+          foreach ($link in $links) {
+            if (-not [string]::IsNullOrWhiteSpace($link)) {
+              try {
+                $fileName = [System.IO.Path]::GetFileName($link)
+                # Menggunakan path download yang baru
+                $outputPath = [System.IO.Path]::Combine($downloadPath, $fileName)
+                Write-Host "Downloading $link to $outputPath..."
+                Invoke-WebRequest -Uri $link.Trim() -OutFile $outputPath
+                Write-Host "Successfully downloaded $fileName."
+                $downloadedFiles++
+              } catch {
+                # Jika download gagal, hanya akan menampilkan error dan lanjut ke link berikutnya
+                Write-Error "Failed to download $link. Error: $_"
+              }
+            }
+          }
+          if ($downloadedFiles -gt 0) {
+            $bot_token = '${{ secrets.TELEGRAM_TOKEN }}'
+            $chat_id = '${{ secrets.TELEGRAM_CHAT_ID }}'
+            $telegram_url = "https://api.telegram.org/bot$bot_token/sendMessage"
+            $message = "✅ *Proses Download Selesai*. $downloadedFiles file telah diunduh ke folder 'Downloads' di RDP."
+            $body = @{ chat_id = $chat_id; text = $message; parse_mode = 'Markdown' } | ConvertTo-Json
+            Invoke-RestMethod -Uri $telegram_url -Method Post -Body $body -ContentType 'application/json'
+          }
+
       - name: Maintain Connection & Send 5-Minute Warning
         run: |
           $repo_name = "${{ github.event.repository.name }}"
@@ -83,27 +185,27 @@ jobs:
           $initial_message_text = "⚠️ *Windows $($repo_name.ToUpper()) sisa waktu 5 menit lagi, Segera persiapkan*"
           $body_send = @{ chat_id = $chat_id; text = $initial_message_text; parse_mode = 'Markdown' } | ConvertTo-Json
           try {
-              $send_response = Invoke-RestMethod -Uri $telegram_send_url -Method Post -Body $body_send -ContentType 'application/json' -ErrorAction Stop
-              $message_id = $send_response.result.message_id
-              Write-Host "Pesan awal berhasil dikirim. Message ID: $message_id"
+            $send_response = Invoke-RestMethod -Uri $telegram_send_url -Method Post -Body $body_send -ContentType 'application/json' -ErrorAction Stop
+            $message_id = $send_response.result.message_id
+            Write-Host "Pesan awal berhasil dikirim. Message ID: $message_id"
           } catch {
-              Write-Error "Gagal mengirim pesan awal. Error: $($_.Exception.Message)"; exit 1
+            Write-Error "Gagal mengirim pesan awal. Error: $($_.Exception.Message)"; exit 1
           }
           Start-Sleep -Seconds 30
           $telegram_edit_url = "https://api.telegram.org/bot$bot_token/editMessageText"
           for ($i = 9; $i -ge 1; $i--) {
-              $seconds_remaining = $i * 30
-              $minutes = [Math]::Floor($seconds_remaining / 60)
-              $seconds = $seconds_remaining % 60
-              $time_text = if ($seconds -eq 0) { "$minutes menit" } else { "$minutes menit $seconds detik" }
-              $edit_message_text = "⚠️ *Windows $($repo_name.ToUpper()) sisa waktu $time_text lagi, Segera persiapkan*"
-              Write-Host "Mengedit pesan: sisa $time_text"
-              $body_edit = @{ chat_id = $chat_id; message_id = $message_id; text = $edit_message_text; parse_mode = 'Markdown' } | ConvertTo-Json
-              try {
-                  Invoke-RestMethod -Uri $telegram_edit_url -Method Post -Body $body_edit -ContentType 'application/json' -ErrorAction SilentlyContinue
-              } catch {
-                  Write-Warning "Gagal mengedit pesan. Error: $($_.Exception.Message)"
-              }
-              Start-Sleep -Seconds 30
+            $seconds_remaining = $i * 30
+            $minutes = [Math]::Floor($seconds_remaining / 60)
+            $seconds = $seconds_remaining % 60
+            $time_text = if ($seconds -eq 0) { "$minutes menit" } else { "$minutes menit $seconds detik" }
+            $edit_message_text = "⚠️ *Windows $($repo_name.ToUpper()) sisa waktu $time_text lagi, Segera persiapkan*"
+            Write-Host "Mengedit pesan: sisa $time_text"
+            $body_edit = @{ chat_id = $chat_id; message_id = $message_id; text = $edit_message_text; parse_mode = 'Markdown' } | ConvertTo-Json
+            try {
+              Invoke-RestMethod -Uri $telegram_edit_url -Method Post -Body $body_edit -ContentType 'application/json' -ErrorAction SilentlyContinue
+            } catch {
+              Write-Warning "Gagal mengedit pesan. Error: $($_.Exception.Message)"
+            }
+            Start-Sleep -Seconds 30
           }
           Write-Host "Sesi RDP telah berakhir."
